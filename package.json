@@ -10,11 +10,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "pdfjs-dist": "^3.11.174",
+    "mupdf": "^1.26.4",
     "react": "^19.1.1",
     "react-dnd": "^16.0.1",
     "react-dnd-html5-backend": "^16.0.1",
-    "react-dom": "^19.1.1"
+    "react-dom": "^19.1.1",
+    "vite-plugin-top-level-await": "^1.6.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.33.0",
