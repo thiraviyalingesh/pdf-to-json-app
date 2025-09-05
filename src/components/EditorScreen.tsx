@@ -1,11 +1,35 @@
 import React, { useEffect, useState } from 'react'
-import * as pdfjsLib from 'pdfjs-dist'
 import { DndProvider } from 'react-dnd'
 import { HTML5Backend } from 'react-dnd-html5-backend'
 import './EditorScreen.css'
 
-// Set the worker source for PDF.js
-pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js`
+// MuPDF.js will be loaded dynamically to handle async initialization
+let mupdfLib: any = null
+
+// Configure MuPDF.js WASM path - must be set before module loads
+declare const globalThis: any
+
+// Set global Module configuration for Emscripten
+globalThis.Module = {
+  locateFile: (path: string, prefix: string) => {
+    console.log(`MuPDF.js locateFile called: path=${path}, prefix=${prefix}`)
+    if (path.endsWith('.wasm')) {
+      return '/mupdf-wasm.wasm'
+    }
+    return prefix + path
+  }
+}
+
+// Also set the specific MuPDF module config
+globalThis.$libmupdf_wasm_Module = {
+  locateFile: (path: string) => {
+    console.log(`MuPDF.js $libmupdf_wasm_Module locateFile called: path=${path}`)
+    if (path.endsWith('.wasm')) {
+      return '/mupdf-wasm.wasm'
+    }
+    return path
+  }
+}
 
 interface EditorScreenProps {
   file: File | null
@@ -21,9 +45,7 @@ interface QuestionData {
 }
 
 const EditorScreen: React.FC<EditorScreenProps> = ({ file, onBack }) => {
-  const [pdfText, setPdfText] = useState<string>('')
   const [isLoading, setIsLoading] = useState(true)
-  const [pdfDocument, setPdfDocument] = useState<pdfjsLib.PDFDocumentProxy | null>(null)
   const [textLines, setTextLines] = useState<string[]>([])
   const [currentQuestion, setCurrentQuestion] = useState<QuestionData>({
     questionNumber: 1,
@@ -40,41 +62,39 @@ const EditorScreen: React.FC<EditorScreenProps> = ({ file, onBack }) => {
     }
   }, [file])
 
-  // Smart quiz text parser - NO LINE BREAKS, SPLIT BY PATTERNS
+  // Dynamic quiz text parser - works with any PDF format
   const parseQuizText = (text: string): string[] => {
     const lines: string[] = []
     
-    // First, split by question numbers (1., 2., 3., etc.)
-    const questionBlocks = text.split(/(?=\d+\.\s)/).filter(q => q.trim().length > 0)
+    // Split text into logical chunks by common delimiters
+    const chunks = text.split(/\n+/).filter(chunk => chunk.trim().length > 5)
     
-    for (const block of questionBlocks) {
-      let remainingText = block.trim()
+    for (const chunk of chunks) {
+      const trimmed = chunk.trim().replace(/\s+/g, ' ')
       
-      // Extract question number and text (everything before first option)
-      const questionMatch = remainingText.match(/^(\d+\.)\s+(.*?)(?=\s*•\s*\([a-d]\)|$)/)
-      if (questionMatch) {
-        const questionText = questionMatch[2].trim()
-        if (questionText) lines.push(`❓ ${questionText}`)
-        remainingText = remainingText.replace(questionMatch[0], '').trim()
+      // Detect questions (starts with number and dot/bracket)
+      if (/^\d+[\.\)]\s+/.test(trimmed)) {
+        lines.push(`❓ ${trimmed}`)
       }
-      
-      // Extract all options • (a), • (b), • (c), • (d)
-      const optionMatches = remainingText.matchAll(/•\s*\(([a-d])\)\s+(.*?)(?=\s*•\s*\([a-d]\)|Answer:|$)/g)
-      for (const match of optionMatches) {
-        const optionLetter = match[1]
-        const optionText = match[2].trim()
-        if (optionText) lines.push(`🔘 (${optionLetter}) ${optionText}`)
-        remainingText = remainingText.replace(match[0], '').trim()
+      // Detect options (various formats: (a), a), A., •(a), etc.)
+      else if (/^[•\-\*]?\s*[\(\[]?[a-dA-D][\)\.\]]\s+/.test(trimmed)) {
+        lines.push(`🔘 ${trimmed}`)
       }
-      
-      // Extract answer
-      const answerMatch = remainingText.match(/Answer:\s*(.+?)(?=\d+\.|$)/)
-      if (answerMatch) {
-        const answerText = answerMatch[1].trim()
-        if (answerText) lines.push(`✅ Answer: ${answerText}`)
+      // Detect answers (Answer:, Ans:, Correct:, etc.)
+      else if (/^(Answer|Ans|Correct|Solution)s?[:]\s*/i.test(trimmed)) {
+        lines.push(`✅ ${trimmed}`)
+      }
+      // Detect explanations (Explanation:, Because:, etc.)
+      else if (/^(Explanation|Because|Reason|Solution)s?[:]\s*/i.test(trimmed)) {
+        lines.push(`💡 ${trimmed}`)
+      }
+      // Regular text content (filter out very short or header-like text)
+      else if (trimmed.length > 15 && !/^[A-Z\s]+$/.test(trimmed)) {
+        lines.push(`📝 ${trimmed}`)
       }
     }
     
+    console.log(`Parsed ${lines.length} lines from PDF text`)
     return lines
   }
 
@@ -82,33 +102,60 @@ const EditorScreen: React.FC<EditorScreenProps> = ({ file, onBack }) => {
     try {
       setIsLoading(true)
       
-      const arrayBuffer = await file.arrayBuffer()
-      const pdf = await pdfjsLib.getDocument(arrayBuffer).promise
-      setPdfDocument(pdf)
-      
-      let fullText = ''
-      
-      let allTextLines: string[] = []
-      
-      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-        const page = await pdf.getPage(pageNum)
-        const textContent = await page.getTextContent()
-        const pageText = textContent.items
-          .map((item: any) => item.str)
-          .join(' ')
-        
-        fullText += `--- Page ${pageNum} ---\n${pageText}\n\n`
-        
-        // Smart parsing for quiz format
-        const smartParsedLines = parseQuizText(pageText)
-        allTextLines = [...allTextLines, ...smartParsedLines]
+      // Load MuPDF.js dynamically
+      if (!mupdfLib) {
+        console.log('Loading MuPDF.js...')
+        mupdfLib = await import('mupdf')
+        console.log('MuPDF.js loaded successfully!')
       }
       
-      setPdfText(fullText || 'No text found in PDF')
+      const arrayBuffer = await file.arrayBuffer()
+      const document = mupdfLib.Document.openDocument(new Uint8Array(arrayBuffer), 'application/pdf')
+      
+      let allTextLines: string[] = []
+      const pageCount = document.countPages()
+      
+      console.log(`PDF loaded with ${pageCount} pages using MuPDF.js v${mupdfLib.version || '1.26+'}`)
+      
+      for (let pageNum = 0; pageNum < pageCount; pageNum++) {
+        try {
+          const page = document.loadPage(pageNum)
+          
+          // Extract structured text with MuPDF.js - try different options for best results
+          let pageText = ''
+          try {
+            const structuredText = page.toStructuredText('preserve-whitespace,preserve-spans')
+            pageText = structuredText.asText()
+          } catch (structError) {
+            console.warn(`Structured text failed for page ${pageNum + 1}, trying basic extraction:`, structError)
+            // Fallback to basic text extraction
+            const basicStructuredText = page.toStructuredText()
+            pageText = basicStructuredText.asText()
+          }
+          
+          console.log(`Page ${pageNum + 1} text extracted (${pageText.length} chars):`, pageText.substring(0, 100) + '...')
+          
+          // Smart parsing for quiz format using the extracted text
+          if (pageText.trim()) {
+            const smartParsedLines = parseQuizText(pageText)
+            allTextLines = [...allTextLines, ...smartParsedLines]
+          }
+        } catch (pageError) {
+          console.error(`Error processing page ${pageNum + 1}:`, pageError)
+          allTextLines.push(`⚠️ Error processing page ${pageNum + 1}`)
+        }
+      }
+      
       setTextLines(allTextLines)
+      console.log(`Total parsed lines with MuPDF.js: ${allTextLines.length}`)
     } catch (error) {
-      console.error('Error extracting text from PDF:', error)
-      setPdfText('Error extracting text from PDF')
+      console.error('Error extracting text from PDF with MuPDF.js:', error)
+      console.error('Error details:', {
+        message: error instanceof Error ? error.message : 'Unknown error',
+        stack: error instanceof Error ? error.stack : undefined,
+        error: error
+      })
+      setTextLines(['❌ Error loading PDF with MuPDF.js. Check console for details.'])
     } finally {
       setIsLoading(false)
     }
@@ -131,9 +178,9 @@ const EditorScreen: React.FC<EditorScreenProps> = ({ file, onBack }) => {
         <div className="drag-drop-container">
           {/* LEFT SIDE - PDF Content */}
           <div className="pdf-content-panel">
-            <h3>📄 PDF Content (Drag Items)</h3>
+            <h3>📄 PDF Content (Drag Items) - ⚡ MuPDF.js Official</h3>
             {isLoading ? (
-              <p>Loading PDF content...</p>
+              <p>Loading PDF content with MuPDF.js (WebAssembly-powered)...</p>
             ) : (
               <div className="draggable-text-list">
                 {textLines.map((line, index) => (
@@ -159,73 +206,8 @@ const EditorScreen: React.FC<EditorScreenProps> = ({ file, onBack }) => {
   )
 }
 
-// PDF Pages rendering component
-const PDFPages: React.FC<{ pdfDocument: pdfjsLib.PDFDocumentProxy }> = ({ pdfDocument }) => {
-  const [currentPage, setCurrentPage] = useState(1)
-  const [pageCanvas, setPageCanvas] = useState<string | null>(null)
-
-  useEffect(() => {
-    renderPage(currentPage)
-  }, [currentPage, pdfDocument])
-
-  const renderPage = async (pageNum: number) => {
-    try {
-      const page = await pdfDocument.getPage(pageNum)
-      const viewport = page.getViewport({ scale: 0.8 })
-      
-      const canvas = document.createElement('canvas')
-      const context = canvas.getContext('2d')
-      
-      if (context) {
-        canvas.height = viewport.height
-        canvas.width = viewport.width
-        
-        const renderContext = {
-          canvasContext: context,
-          viewport: viewport
-        }
-        
-        await page.render(renderContext).promise
-        setPageCanvas(canvas.toDataURL())
-      }
-    } catch (error) {
-      console.error('Error rendering page:', error)
-    }
-  }
-
-  const goToPage = (pageNum: number) => {
-    if (pageNum >= 1 && pageNum <= pdfDocument.numPages) {
-      setCurrentPage(pageNum)
-    }
-  }
-
-  return (
-    <div className="pdf-renderer">
-      <div className="page-controls">
-        <button 
-          onClick={() => goToPage(currentPage - 1)}
-          disabled={currentPage <= 1}
-        >
-          Previous
-        </button>
-        <span>Page {currentPage} of {pdfDocument.numPages}</span>
-        <button 
-          onClick={() => goToPage(currentPage + 1)}
-          disabled={currentPage >= pdfDocument.numPages}
-        >
-          Next
-        </button>
-      </div>
-      <div className="page-canvas">
-        {pageCanvas ? (
-          <img src={pageCanvas} alt={`PDF Page ${currentPage}`} />
-        ) : (
-          <p>Rendering page...</p>
-        )}
-      </div>
-    </div>
-  )
-}
+// PDF Pages rendering component - removed for now to focus on text extraction
+// const PDFPages component will be implemented later if needed
 
 // Draggable Text Component
 import { useDrag, useDrop } from 'react-dnd'
@@ -233,16 +215,16 @@ import { useDrag, useDrop } from 'react-dnd'
 const DraggableText: React.FC<{ text: string; index: number }> = ({ text, index }) => {
   const [{ isDragging }, drag] = useDrag(() => ({
     type: 'text',
-    item: () => ({ text, index, id: `${index}-${Date.now()}` }), // Create new item each time
+    item: () => ({ text, index, id: `${index}-${Date.now()}` }),
     collect: (monitor) => ({
       isDragging: !!monitor.isDragging(),
     }),
-    canDrag: true, // Always allow dragging
-  }), [text, index]) // Dependencies to recreate drag spec
+    canDrag: true,
+  }), [text, index])
 
   return (
     <div
-      ref={drag}
+      ref={drag as any}
       className={`draggable-text ${isDragging ? 'dragging' : ''}`}
       style={{
         opacity: isDragging ? 0.7 : 1,
@@ -289,7 +271,7 @@ const DropZone: React.FC<{
 
   return (
     <div
-      ref={drop}
+      ref={drop as any}
       className={`drop-zone ${className} ${isOver ? 'drop-over' : ''}`}
       style={{
         minHeight: '60px',
